@@ -1,0 +1,44 @@
+{
+  "applicability_domain_threshold": 0.7005318999290466,
+  "random_top_failures": [
+    "4-Methoxybenzoate",
+    "2.3-Dimethvl-2.3-butanedio",
+    "propazine (6-chloro-2,4-isopropylamino-1,3,5-triazine)",
+    "1,3,5-Trimethoxy-benzene (TMB)",
+    "N-(hydroxymethyl)prop-2-enamide",
+    "alpha-Pinene",
+    "Gallic acid",
+    "Acetic",
+    "4-Methoxybenzoate",
+    "tyrosine"
+  ],
+  "scaffold_top_failures": [
+    "Acetic Acid",
+    "2.3-Dimethvl-2.3-butanedio",
+    "Congo red",
+    "Congo red",
+    "aminothiourea",
+    "aminothiourea",
+    "urea",
+    "Methacrylic acid",
+    "3-(Aminooxy)-1-propanamine",
+    "3-(Aminooxy)-1-propanamine"
+  ],
+  "shap_top15": {
+    "SMR_VSA7": 0.11632424134265365,
+    "SlogP_VSA6": 0.09850476240458328,
+    "RingCount": 0.04357977651218619,
+    "Chi4n": 0.042344756728132385,
+    "BCUT2D_MRLOW": 0.04160975885110927,
+    "Chi4v": 0.036748800108952276,
+    "FpDensityMorgan3": 0.03639182262332206,
+    "PEOE_VSA13": 0.030460456676491953,
+    "BCUT2D_MRHI": 0.02893282970553473,
+    "Chi3v": 0.02866404487072596,
+    "VSA_EState5": 0.026466284445148702,
+    "NumAromaticRings": 0.024588426205611462,
+    "SMR_VSA6": 0.024274544770691246,
+    "MolLogP": 0.02392097910351378,
+    "VSA_EState4": 0.022424640374386014
+  }
+}
