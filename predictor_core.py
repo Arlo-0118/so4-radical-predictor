@@ -22,11 +22,29 @@ class PredictorPaths:
 
     @property
     def artifact_dir(self) -> Path:
-        return self.root_dir / "artifacts" / "big_qsar_so4_v2_mixed"
+        preferred = self.root_dir / "artifacts" / "big_qsar_so4_v2_mixed"
+        if preferred.exists():
+            return preferred
+        # Fallback for repositories where model files were uploaded at repo root.
+        required = [
+            "metrics.json",
+            "cleaned_rows_aggregated.csv",
+            "catboost_model.joblib",
+            "stacked_cat_model.joblib",
+        ]
+        if all((self.root_dir / name).exists() for name in required):
+            return self.root_dir
+        return preferred
 
     @property
     def enhancement_dir(self) -> Path:
-        return self.artifact_dir / "esandt_enhancements"
+        preferred = self.artifact_dir / "esandt_enhancements"
+        if preferred.exists():
+            return preferred
+        fallback = self.root_dir / "esandt_enhancements"
+        if fallback.exists():
+            return fallback
+        return preferred
 
 
 def standardize_molecule(smiles: str):
