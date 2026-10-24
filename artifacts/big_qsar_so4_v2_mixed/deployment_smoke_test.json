@@ -1,0 +1,21 @@
+{
+  "status": "PASS",
+  "n_cases": 2,
+  "feature_dimension": 1249,
+  "outputs": [
+    {
+      "case": "known_structure_missing_conditions",
+      "prediction": 8.33093424333895,
+      "base_sd": 0.03277696296572685,
+      "lower": 7.891036048215454,
+      "upper": 8.770832438462447
+    },
+    {
+      "case": "known_structure_with_conditions",
+      "prediction": 8.482122778923364,
+      "base_sd": 0.11168588697910309,
+      "lower": 8.008614332509072,
+      "upper": 8.955631225337655
+    }
+  ]
+}
