@@ -1,7 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import io
 import json
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,458 +17,339 @@ from rdkit.Chem.MolStandardize import rdMolStandardize
 RDLogger.DisableLog("rdApp.*")
 
 
-@dataclass
+@dataclass(frozen=True)
 class PredictorPaths:
     root_dir: Path = Path(__file__).resolve().parent
 
     @property
     def artifact_dir(self) -> Path:
-        preferred = self.root_dir / "artifacts" / "big_qsar_so4_v2_mixed"
-        if preferred.exists():
-            return preferred
-        # Fallback for repositories where model files were uploaded at repo root.
-        required = [
-            "metrics.json",
-            "cleaned_rows_aggregated.csv",
-            "catboost_model.joblib",
-            "stacked_cat_model.joblib",
-        ]
-        if all((self.root_dir / name).exists() for name in required):
-            return self.root_dir
-        return preferred
-
-    @property
-    def enhancement_dir(self) -> Path:
-        preferred = self.artifact_dir / "esandt_enhancements"
-        if preferred.exists():
-            return preferred
-        fallback = self.root_dir / "esandt_enhancements"
-        if fallback.exists():
-            return fallback
-        return preferred
+        return self.root_dir / "artifacts" / "big_qsar_so4_v2_mixed"
 
 
 def standardize_molecule(smiles: str):
-    if smiles is None or pd.isna(smiles):
+    if smiles is None or not str(smiles).strip():
         return None, None, None
     try:
-        mol = Chem.MolFromSmiles(str(smiles))
+        mol = Chem.MolFromSmiles(str(smiles).strip())
         if mol is None:
             return None, None, None
         mol = rdMolStandardize.Cleanup(mol)
         Chem.SanitizeMol(mol)
-        can = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
-        parent = rdMolStandardize.FragmentParent(mol)
-        parent = rdMolStandardize.Cleanup(parent)
+        canonical = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+        parent = rdMolStandardize.Cleanup(rdMolStandardize.FragmentParent(mol))
         parent_smiles = Chem.MolToSmiles(parent, canonical=True, isomericSmiles=True)
-        inchi_key = Chem.MolToInchiKey(mol)
-        return can, parent_smiles, inchi_key
+        return canonical, parent_smiles, Chem.MolToInchiKey(mol)
     except Exception:
         return None, None, None
 
 
-def descriptor_names() -> List[str]:
+def _descriptor_names() -> List[str]:
     return [name for name, _ in Descriptors._descList]
 
 
-def compute_descriptor_block(mol):
-    vals = []
-    for _, fn in Descriptors._descList:
+def _descriptor_block(mol: Chem.Mol) -> np.ndarray:
+    values = []
+    for _, function in Descriptors._descList:
         try:
-            v = float(fn(mol))
-            if np.isnan(v) or np.isinf(v):
-                v = 0.0
+            value = float(function(mol))
+            values.append(value if np.isfinite(value) else 0.0)
         except Exception:
-            v = 0.0
-        vals.append(v)
-    return np.asarray(vals, dtype=np.float32)
+            values.append(0.0)
+    return np.asarray(values, dtype=np.float32)
 
 
-def compute_fp_block(mol, n_bits: int):
-    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=n_bits)
-    arr = np.zeros((n_bits,), dtype=np.float32)
-    DataStructs.ConvertToNumpyArray(fp, arr)
-    return arr
+def _fingerprint(mol: Chem.Mol, n_bits: int = 1024):
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=n_bits)
 
 
-def compute_so4_prior(desc_df: pd.DataFrame):
-    cols = desc_df.columns
+def _fingerprint_array(mol: Chem.Mol, n_bits: int = 1024) -> np.ndarray:
+    fp = _fingerprint(mol, n_bits)
+    values = np.zeros(n_bits, dtype=np.float32)
+    DataStructs.ConvertToNumpyArray(fp, values)
+    return values
 
-    def col(name):
-        return desc_df[name].to_numpy() if name in cols else np.zeros(len(desc_df), dtype=np.float32)
 
-    prior = (
-        0.18 * col("NumAromaticRings")
-        + 0.16 * col("NumHeteroatoms")
-        + 0.14 * col("MolMR")
-        + 0.10 * col("BertzCT")
-        - 0.12 * col("FractionCSP3")
-        - 0.10 * col("NumRotatableBonds")
-        + 0.10 * col("TPSA")
-        + 0.10 * col("MaxAbsPartialCharge")
+def _raw_so4_prior(descriptors: Dict[str, float]) -> float:
+    return float(
+        0.18 * descriptors["NumAromaticRings"]
+        + 0.16 * descriptors["NumHeteroatoms"]
+        + 0.14 * descriptors["MolMR"]
+        + 0.10 * descriptors["BertzCT"]
+        - 0.12 * descriptors["FractionCSP3"]
+        - 0.10 * descriptors["NumRotatableBonds"]
+        - 0.10 * descriptors["TPSA"]
+        + 0.08 * abs(descriptors["MaxAbsPartialCharge"])
     )
-    return prior.astype(np.float32)
 
 
 class SO4Predictor:
     def __init__(self, paths: Optional[PredictorPaths] = None):
         self.paths = paths or PredictorPaths()
-        self.fp_bits = 1024
-        self.conformal_alpha = 0.10
-        self.conformal_beta = 1.0
-        self.nominal_coverage = 1.0 - self.conformal_alpha
-
-        self.metrics = json.loads((self.paths.artifact_dir / "metrics.json").read_text(encoding="utf-8"))
-        self.q_hat = float(self.metrics["metrics"]["conformal"]["q_hat"])
+        artifact = self.paths.artifact_dir
+        self.manifest = json.loads((artifact / "deployment_manifest.json").read_text(encoding="utf-8"))
+        self.feature_names = list(self.manifest["feature_names"])
+        self.meta_indices = np.asarray(self.manifest["meta_feature_indices"], dtype=int)
+        self.base_order = list(self.manifest["base_model_order"])
         self.base_models = {
-            "catboost": joblib.load(self.paths.artifact_dir / "catboost_model.joblib"),
-            "catboost_b": joblib.load(self.paths.artifact_dir / "catboost_b_model.joblib"),
-            "lightgbm": joblib.load(self.paths.artifact_dir / "lightgbm_model.joblib"),
-            "xgboost": joblib.load(self.paths.artifact_dir / "xgboost_model.joblib"),
-            "xgboost_b": joblib.load(self.paths.artifact_dir / "xgboost_b_model.joblib"),
+            "catboost": joblib.load(artifact / "catboost_model.joblib"),
+            "catboost_b": joblib.load(artifact / "catboost_b_model.joblib"),
+            "lightgbm": joblib.load(artifact / "lightgbm_model.joblib"),
+            "xgboost": joblib.load(artifact / "xgboost_model.joblib"),
+            "xgboost_b": joblib.load(artifact / "xgboost_b_model.joblib"),
         }
-        self.meta_cat = joblib.load(self.paths.artifact_dir / "stacked_cat_model.joblib")
-        self.meta_ridge = joblib.load(self.paths.artifact_dir / "stacked_ridge_model.joblib")
-
-        self.agg_df = pd.read_csv(self.paths.artifact_dir / "cleaned_rows_aggregated.csv")
-        self.model_df = self.agg_df[self.agg_df["kept_for_model"].astype(str).str.lower() == "true"].copy().reset_index(drop=True)
-        self.feature_names, self.meta_feature_idx = self._prepare_reference_features()
-
-        self.reference_mols = [Chem.MolFromSmiles(s) for s in self.model_df["smiles_rdkit"]]
-        self.reference_fps = [AllChem.GetMorganFingerprintAsBitVect(m, radius=2, nBits=self.fp_bits) for m in self.reference_mols]
-
-        self.ad_threshold = float(json.loads((self.paths.artifact_dir / "esandt_extension_summary.json").read_text(encoding="utf-8"))["applicability_domain_threshold"])
-        self.random_bins = pd.read_csv(self.paths.enhancement_dir / "random_similarity_bin_error_summary.csv")
-        self.scaffold_bins = pd.read_csv(self.paths.enhancement_dir / "scaffold_similarity_bin_error_summary.csv")
-
-    def _prepare_reference_features(self):
-        mols = [Chem.MolFromSmiles(s) for s in self.model_df["smiles_rdkit"]]
-        desc = np.vstack([compute_descriptor_block(m) for m in mols]).astype(np.float32)
-        desc_df = pd.DataFrame(desc, columns=descriptor_names())
-        num = self.model_df[["pH", "temp_C", "pH_over_TK", "rep_n", "rep_std", "n_source_blocks", "all_conditions_missing"]].copy()
-        for col in ["pH", "temp_C", "pH_over_TK"]:
-            num[f"{col}_missing"] = num[col].isna().astype(np.float32)
-        num_df = num.fillna(-999.0)
-        src_cols = [
-            "src_A_raw_k_with_smiles",
-            "src_B_logk_name_only",
-            "src_C_logk_with_pH_T",
-            "src_D_logk_with_pH_over_TK",
-        ]
-        feature_names = (
-            descriptor_names()
-            + [f"ECFP4_{i}" for i in range(self.fp_bits)]
-            + ["so4_prior"]
-            + list(num_df.columns)
-            + src_cols
+        self.meta_cat = joblib.load(artifact / "stacked_cat_model.joblib")
+        self.meta_ridge = joblib.load(artifact / "stacked_ridge_model.joblib")
+        self.reference = pd.read_csv(artifact / "deployment_reference.csv")
+        span_table = pd.read_csv(artifact / "cross_source_same_structure_label_span.csv")
+        self.reference_label_spans = dict(
+            zip(span_table["parent_smiles"].astype(str), span_table["logK_span"].astype(float))
         )
-        meta_feature_idx = np.concatenate(
-            [
-                np.arange(len(descriptor_names()), dtype=int),
-                np.array([len(descriptor_names()) + self.fp_bits], dtype=int),
-                np.arange(len(descriptor_names()) + self.fp_bits + 1, len(feature_names), dtype=int),
-            ]
-        )
-        return feature_names, meta_feature_idx
-
-    def _source_flags(self, p_h: Optional[float], temp_c: Optional[float], p_h_over_tk: Optional[float]) -> Dict[str, int]:
-        flags = {
-            "src_A_raw_k_with_smiles": 0,
-            "src_B_logk_name_only": 0,
-            "src_C_logk_with_pH_T": 0,
-            "src_D_logk_with_pH_over_TK": 0,
+        self.reference_mols = [Chem.MolFromSmiles(value) for value in self.reference["smiles_rdkit"]]
+        self.reference_fps = [_fingerprint(mol) for mol in self.reference_mols]
+        self.q_hat = float(self.manifest["calibration"]["q_hat"])
+        self.beta = float(self.manifest["calibration"]["beta"])
+        ad_policy = self.manifest["ad_policy"]
+        self.formal_ad_threshold = float(ad_policy["formal_structure_ad_threshold"])
+        self.severe_similarity_threshold = float(ad_policy["severe_structure_warning_threshold"])
+        self.condition_ranges = self.manifest["condition_policy"]["observed_training_ranges"]
+        self.missing_sentinel = float(self.manifest["condition_policy"]["missing_continuous_encoding"])
+        prior = self.manifest["so4_prior"]
+        self.prior_mean = float(prior["training_mean"])
+        self.prior_std = float(prior["training_std"])
+        warning_policy = self.manifest["failure_warning_policy"]
+        self.label_span_threshold = float(warning_policy["adjacent_reference_label_span_threshold"])
+        self.electronic_thresholds = {
+            "MaxAbsPartialCharge": float(warning_policy["max_abs_partial_charge_threshold"]),
+            "TPSA": float(warning_policy["tpsa_threshold"]),
         }
-        if p_h_over_tk is not None:
-            flags["src_D_logk_with_pH_over_TK"] = 1
-            surrogate = "condition-template:D"
-        elif p_h is not None or temp_c is not None:
-            flags["src_C_logk_with_pH_T"] = 1
-            surrogate = "condition-template:C"
-        else:
-            flags["src_B_logk_name_only"] = 1
-            surrogate = "condition-template:B"
-        flags["source_surrogate"] = surrogate
-        return flags
 
-    def _build_query_df(self, smiles: str, p_h=None, temp_c=None, p_h_over_tk=None) -> pd.DataFrame:
-        smiles_rdkit, parent_smiles, _ = standardize_molecule(smiles)
-        if smiles_rdkit is None:
-            raise ValueError("SMILES could not be parsed or standardized by RDKit.")
-        flags = self._source_flags(p_h, temp_c, p_h_over_tk)
-        all_missing = int(p_h is None and temp_c is None and p_h_over_tk is None)
-        return pd.DataFrame([
+        expected_descriptors = int(self.manifest["feature_dimensions"]["rdkit_2d"])
+        if len(_descriptor_names()) != expected_descriptors:
+            raise RuntimeError(
+                f"RDKit descriptor mismatch: expected {expected_descriptors}, got {len(_descriptor_names())}. "
+                "Install the versions pinned in requirements.txt."
+            )
+
+    @staticmethod
+    def _normalize_conditions(p_h, temp_c, p_h_over_tk):
+        p_h = None if p_h is None else float(p_h)
+        temp_c = None if temp_c is None else float(temp_c)
+        p_h_over_tk = None if p_h_over_tk is None else float(p_h_over_tk)
+        if p_h is not None and not 0.0 <= p_h <= 14.0:
+            raise ValueError(
+                "pH must be between 0 and 14 for this environmental aqueous-phase tool. "
+                "Values outside this physical input guardrail are not accepted."
+            )
+        derived = False
+        if p_h_over_tk is None and p_h is not None and temp_c is not None:
+            p_h_over_tk = p_h / (temp_c + 273.15)
+            derived = True
+        return p_h, temp_c, p_h_over_tk, derived
+
+    def _build_features(self, mol: Chem.Mol, p_h, temp_c, p_h_over_tk) -> pd.DataFrame:
+        descriptor_values = _descriptor_block(mol)
+        descriptor_map = dict(zip(_descriptor_names(), descriptor_values))
+        prior_raw = _raw_so4_prior(descriptor_map)
+        prior_z = (prior_raw - self.prior_mean) / (self.prior_std + 1e-8)
+        missing = {"pH": p_h is None, "temp_C": temp_c is None, "pH_over_TK": p_h_over_tk is None}
+        feature_map: Dict[str, float] = dict(descriptor_map)
+        feature_map.update({f"ECFP4_{i}": float(value) for i, value in enumerate(_fingerprint_array(mol))})
+        feature_map.update(
             {
-                "parent_smiles": parent_smiles,
-                "smiles_rdkit": smiles_rdkit,
-                "compound_name": "QUERY_MOLECULE",
-                "pH": np.nan if p_h is None else float(p_h),
-                "temp_C": np.nan if temp_c is None else float(temp_c),
-                "pH_over_TK": np.nan if p_h_over_tk is None else float(p_h_over_tk),
-                "rep_n": 1.0,
-                "rep_std": 0.0,
-                "n_source_blocks": 1.0,
-                "all_conditions_missing": float(all_missing),
-                "logK": 0.0,
-                "source_block": flags["source_surrogate"],
-                "src_A_raw_k_with_smiles": flags["src_A_raw_k_with_smiles"],
-                "src_B_logk_name_only": flags["src_B_logk_name_only"],
-                "src_C_logk_with_pH_T": flags["src_C_logk_with_pH_T"],
-                "src_D_logk_with_pH_over_TK": flags["src_D_logk_with_pH_over_TK"],
+                "so4_prior": float(prior_z),
+                "pH": self.missing_sentinel if p_h is None else p_h,
+                "temp_C": self.missing_sentinel if temp_c is None else temp_c,
+                "pH_over_TK": self.missing_sentinel if p_h_over_tk is None else p_h_over_tk,
+                "all_conditions_missing": float(all(missing.values())),
+                "pH_missing": float(missing["pH"]),
+                "temp_C_missing": float(missing["temp_C"]),
+                "pH_over_TK_missing": float(missing["pH_over_TK"]),
             }
-        ])
+        )
+        frame = pd.DataFrame([[feature_map[name] for name in self.feature_names]], columns=self.feature_names)
+        return frame.astype(np.float32)
 
-    def _build_query_features(self, query_df: pd.DataFrame) -> pd.DataFrame:
-        mol = Chem.MolFromSmiles(query_df.iloc[0]["smiles_rdkit"])
-        desc = compute_descriptor_block(mol)[None, :]
-        fp = compute_fp_block(mol, self.fp_bits)[None, :]
-        desc_df = pd.DataFrame(desc, columns=descriptor_names())
-        so4_prior = compute_so4_prior(desc_df)[:, None]
-        num = query_df[["pH", "temp_C", "pH_over_TK", "rep_n", "rep_std", "n_source_blocks", "all_conditions_missing"]].copy()
-        for col in ["pH", "temp_C", "pH_over_TK"]:
-            num[f"{col}_missing"] = num[col].isna().astype(np.float32)
-        num_df = num.fillna(-999.0).to_numpy(dtype=np.float32)
-        src = query_df[["src_A_raw_k_with_smiles", "src_B_logk_name_only", "src_C_logk_with_pH_T", "src_D_logk_with_pH_over_TK"]].astype(np.float32).to_numpy(dtype=np.float32)
-        x = np.concatenate([desc, fp, so4_prior, num_df, src], axis=1).astype(np.float32)
-        return pd.DataFrame(x, columns=self.feature_names)
-
-    def _similarity_bin(self, sim: float) -> str:
-        if sim < 0.4:
-            return "<0.4"
-        if sim < 0.6:
-            return "0.4-0.6"
-        return ">=0.6"
-
-    def _lookup_expected_error(self, sim: float) -> Dict[str, float]:
-        idx = 0 if sim < 0.4 else 1 if sim < 0.6 else 2
+    def _condition_assessment(self, p_h, temp_c, p_h_over_tk) -> Dict[str, Any]:
+        supplied = {"pH": p_h, "temp_C": temp_c, "pH_over_TK": p_h_over_tk}
+        warnings = []
+        for name, value in supplied.items():
+            if value is None:
+                continue
+            limits = self.condition_ranges[name]
+            if value < limits["min"] or value > limits["max"]:
+                warnings.append(f"{name}={value:.4g} is outside the training range [{limits['min']}, {limits['max']}]")
         return {
-            "random_mean_abs_error": float(self.random_bins.iloc[idx]["mean_abs_error"]),
-            "random_median_abs_error": float(self.random_bins.iloc[idx]["median_abs_error"]),
-            "scaffold_mean_abs_error": float(self.scaffold_bins.iloc[idx]["mean_abs_error"]),
-            "scaffold_median_abs_error": float(self.scaffold_bins.iloc[idx]["median_abs_error"]),
-            "scaffold_coverage": float(self.scaffold_bins.iloc[idx]["coverage"]),
+            "status": "out-of-range" if warnings else ("not-assessed-missing" if all(v is None for v in supplied.values()) else "within-observed-range"),
+            "warnings": warnings,
+            "observed_training_ranges": self.condition_ranges,
         }
 
-    def _risk_flags(self, mol: Chem.Mol, nn_similarity: float) -> List[str]:
-        flags: List[str] = []
-        mw = float(Descriptors.MolWt(mol))
+    def _structure_assessment(self, nn_similarity: float) -> Dict[str, Any]:
+        if nn_similarity >= self.formal_ad_threshold:
+            status = "in-domain"
+            risk_tier = "low"
+            message = "The query is within the formal empirical structural AD."
+        elif nn_similarity >= self.severe_similarity_threshold:
+            status = "out-of-domain"
+            risk_tier = "moderate"
+            message = "The query is outside the formal structural AD; interpret the estimate as extrapolative."
+        else:
+            status = "severe-extrapolation"
+            risk_tier = "high"
+            message = "Severe structural extrapolation warning; experimental verification is strongly recommended."
+        return {
+            "status": status,
+            "risk_tier": risk_tier,
+            "nearest_neighbor_similarity": nn_similarity,
+            "formal_ad_threshold": self.formal_ad_threshold,
+            "severe_warning_threshold": self.severe_similarity_threshold,
+            "message": message,
+        }
+
+    @staticmethod
+    def _multisite_reactivity(mol: Chem.Mol) -> bool:
+        azo = len(mol.GetSubstructMatches(Chem.MolFromSmarts("[N;X2]=[N;X2]")))
+        sulfonate = len(mol.GetSubstructMatches(Chem.MolFromSmarts("S(=O)(=O)[O-,OH]")))
+        heteroatoms = sum(atom.GetAtomicNum() not in {1, 6} for atom in mol.GetAtoms())
+        aromatic_rings = int(Descriptors.NumAromaticRings(mol))
+        formal_charge = abs(sum(atom.GetFormalCharge() for atom in mol.GetAtoms()))
+        return bool(
+            (azo >= 1 and sulfonate >= 1)
+            or (heteroatoms >= 6 and formal_charge >= 1)
+            or (aromatic_rings >= 2 and heteroatoms >= 5)
+        )
+
+    @staticmethod
+    def _max_abs_gasteiger_charge(mol: Chem.Mol) -> float:
+        try:
+            Chem.rdPartialCharges.ComputeGasteigerCharges(mol)
+            values = [abs(float(atom.GetProp("_GasteigerCharge"))) for atom in mol.GetAtoms()]
+            finite = [value for value in values if np.isfinite(value)]
+            return max(finite, default=0.0)
+        except Exception:
+            return 0.0
+
+    def _neighbors(self, query_fp, top_k: int):
+        similarities = np.asarray(DataStructs.BulkTanimotoSimilarity(query_fp, self.reference_fps), dtype=float)
+        order = np.argsort(-similarities)[:top_k]
+        rows = []
+        for idx in order:
+            ref = self.reference.iloc[int(idx)]
+            rows.append(
+                {
+                    "compound_name": str(ref.get("compound_name", "")),
+                    "smiles": str(ref["smiles_rdkit"]),
+                    "logK": float(ref["logK"]),
+                    "similarity": float(similarities[idx]),
+                }
+            )
+        return similarities, rows
+
+    def _warning_assessment(self, mol, similarities):
+        score = 0
+        flags = []
+        nn_similarity = float(np.max(similarities))
+        if nn_similarity < self.severe_similarity_threshold:
+            score += 2
+            flags.append("severe_structural_novelty")
+
+        nearest_idx = int(np.argmax(similarities))
+        nearest_parent = str(self.reference.iloc[nearest_idx]["parent_smiles"])
+        label_span = float(self.reference_label_spans.get(nearest_parent, 0.0))
+        if label_span > self.label_span_threshold:
+            score += 2
+            flags.append("adjacent_analogue_disagreement")
+
+        if self._multisite_reactivity(mol):
+            score += 1
+            flags.append("multisite_reactivity")
+
+        max_charge = self._max_abs_gasteiger_charge(mol)
         tpsa = float(Descriptors.TPSA(mol))
-        hetero = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() not in (1, 6))
-        has_charge = any(a.GetFormalCharge() != 0 for a in mol.GetAtoms())
-        acid = mol.HasSubstructMatch(Chem.MolFromSmarts("[CX3](=O)[OX2H1,O-]"))
-        amine = mol.HasSubstructMatch(Chem.MolFromSmarts("[NX3;H2,H1,H0;+0,+1]"))
-        if has_charge:
-            flags.append("high_ionicity")
-        if acid and mw < 120:
-            flags.append("small_acid")
-        if tpsa > 90 and hetero >= 4:
-            flags.append("polar_multifunctional")
-        if amine and tpsa > 70 and hetero >= 3:
-            flags.append("strongly_polar_n_containing")
-        if nn_similarity < 0.4:
-            flags.append("novel_scaffold_or_chemotype")
-        return flags
+        if max_charge >= self.electronic_thresholds["MaxAbsPartialCharge"] or tpsa >= self.electronic_thresholds["TPSA"]:
+            score += 1
+            flags.append("electronic_or_surface_extreme")
 
-    def _recommended_use(self, nn_similarity: float, half_width: float, risk_flags: List[str]) -> str:
-        if nn_similarity >= 0.6 and half_width <= 0.40 and not any(f in risk_flags for f in ["high_ionicity", "small_acid", "polar_multifunctional", "novel_scaffold_or_chemotype"]):
-            return "screening-ready"
-        if nn_similarity >= 0.4:
-            return "use-with-caution"
-        return "coarse-screen-only"
-
-    def _domain_level(self, nn_similarity: float, half_width: float) -> str:
-        if nn_similarity >= 0.6 and half_width <= 0.40:
-            return "In-domain"
-        if nn_similarity >= 0.4:
-            return "Borderline"
-        return "Out-of-domain"
-
-    def _confidence_level(self, nn_similarity: float, half_width: float, risk_flags: List[str]) -> str:
-        major_risks = {"high_ionicity", "small_acid", "polar_multifunctional", "novel_scaffold_or_chemotype"}
-        risk_count = sum(1 for f in risk_flags if f in major_risks)
-        if nn_similarity >= 0.7 and half_width <= 0.35 and risk_count == 0:
-            return "high-confidence"
-        if nn_similarity >= 0.4 and half_width <= 0.65 and risk_count <= 1:
-            return "medium-confidence"
-        return "low-confidence"
+        risk_tier = "low" if score == 0 else ("moderate" if score <= 2 else "high")
+        return {
+            "score": score,
+            "risk_tier": risk_tier,
+            "flagged": bool(score >= 3),
+            "flags": flags,
+            "nearest_analogue_label_span": label_span,
+            "nearest_analogue_parent_smiles": nearest_parent,
+            "action": "experimental verification required" if score >= 3 else (
+                "interpret with caution" if score >= 1 else "screening use within stated uncertainty"
+            ),
+        }
 
     def predict(self, smiles: str, p_h=None, temp_c=None, p_h_over_tk=None, top_k_neighbors: int = 5) -> Dict[str, Any]:
-        query_df = self._build_query_df(smiles=smiles, p_h=p_h, temp_c=temp_c, p_h_over_tk=p_h_over_tk)
-        x_query_df = self._build_query_features(query_df)
-        base_preds = np.asarray([float(model.predict(x_query_df)[0]) for model in self.base_models.values()], dtype=np.float32)
-        sigma = float(np.std(base_preds))
-        meta_array = np.concatenate([base_preds[None, :], x_query_df.to_numpy(dtype=np.float32)[:, self.meta_feature_idx]], axis=1)
-        pred_cat = float(self.meta_cat.predict(meta_array)[0])
-        pred_ridge = float(self.meta_ridge.predict(base_preds[None, :])[0])
-        pred_logk = float(0.7 * pred_cat + 0.3 * pred_ridge)
-        half_width = float(self.q_hat * (1.0 + self.conformal_beta * sigma))
-        ci_lower = pred_logk - half_width
-        ci_upper = pred_logk + half_width
-        pred_k = float(10 ** pred_logk)
+        canonical, parent_smiles, inchi_key = standardize_molecule(smiles)
+        if canonical is None:
+            raise ValueError("The SMILES could not be parsed and standardized by RDKit.")
+        mol = Chem.MolFromSmiles(canonical)
+        p_h, temp_c, p_h_over_tk, ratio_derived = self._normalize_conditions(p_h, temp_c, p_h_over_tk)
+        features = self._build_features(mol, p_h, temp_c, p_h_over_tk)
+        x = features.to_numpy(dtype=np.float32)
+        base_predictions = np.asarray(
+            [float(self.base_models[name].predict(features)[0]) for name in self.base_order], dtype=np.float32
+        )
+        sigma = float(np.std(base_predictions))
+        meta_cat_input = np.concatenate([base_predictions.reshape(1, -1), x[:, self.meta_indices]], axis=1)
+        meta_cat = float(self.meta_cat.predict(meta_cat_input)[0])
+        meta_ridge = float(self.meta_ridge.predict(base_predictions.reshape(1, -1))[0])
+        prediction = 0.7 * meta_cat + 0.3 * meta_ridge
+        half_width = self.q_hat * (1.0 + self.beta * sigma)
 
-        mol = Chem.MolFromSmiles(query_df.iloc[0]["smiles_rdkit"])
-        query_fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=self.fp_bits)
-        similarities = np.asarray(DataStructs.BulkTanimotoSimilarity(query_fp, self.reference_fps), dtype=np.float32)
-        order = np.argsort(similarities)[::-1]
-        top_idx = order[:top_k_neighbors]
-        nn_similarity = float(similarities[top_idx[0]])
-        empirical_in_domain = bool(nn_similarity >= self.ad_threshold)
-
-        neighbors = []
-        for idx in top_idx:
-            row = self.model_df.iloc[int(idx)]
-            neighbors.append({
-                "compound_name": str(row["compound_name"]),
-                "parent_smiles": str(row["parent_smiles"]),
-                "logK": float(row["logK"]),
-                "similarity": float(similarities[int(idx)]),
-            })
-
-        risk_flags = self._risk_flags(mol, nn_similarity)
-        expected_error = self._lookup_expected_error(nn_similarity)
-        domain_level = self._domain_level(nn_similarity, half_width)
-        confidence_level = self._confidence_level(nn_similarity, half_width, risk_flags)
-        recommended_use = self._recommended_use(nn_similarity, half_width, risk_flags)
+        query_fp = _fingerprint(mol)
+        similarities, neighbors = self._neighbors(query_fp, max(3, int(top_k_neighbors)))
+        nn_similarity = float(np.max(similarities))
+        structure = self._structure_assessment(nn_similarity)
+        condition = self._condition_assessment(p_h, temp_c, p_h_over_tk)
+        warning = self._warning_assessment(mol, similarities)
+        if structure["risk_tier"] == "high" or warning["risk_tier"] == "high" or condition["status"] == "out-of-range":
+            overall_risk = "high"
+        elif structure["risk_tier"] == "moderate" or warning["risk_tier"] == "moderate":
+            overall_risk = "moderate"
+        else:
+            overall_risk = "low"
 
         return {
             "input": {
                 "smiles": smiles,
-                "canonical_smiles": str(query_df.iloc[0]["smiles_rdkit"]),
-                "parent_smiles": str(query_df.iloc[0]["parent_smiles"]),
-                "pH": None if p_h is None else float(p_h),
-                "temp_C": None if temp_c is None else float(temp_c),
-                "pH_over_TK": None if p_h_over_tk is None else float(p_h_over_tk),
-                "source_surrogate": str(query_df.iloc[0]["source_block"]),
+                "canonical_smiles": canonical,
+                "parent_smiles": parent_smiles,
+                "inchi_key": inchi_key,
+                "conditions": {"pH": p_h, "temp_C": temp_c, "pH_over_TK": p_h_over_tk},
+                "pH_over_TK_derived_from_pH_and_temperature": ratio_derived,
+                "missing_continuous_encoding": self.missing_sentinel,
             },
             "prediction": {
-                "pred_logK": pred_logk,
-                "pred_kSO4": pred_k,
-                "ci_lower": float(ci_lower),
-                "ci_upper": float(ci_upper),
-                "ci_half_width": half_width,
+                "logK": prediction,
+                "k_M-1_s-1": float(10.0 ** prediction),
+                "ci_lower": prediction - half_width,
+                "ci_upper": prediction + half_width,
+                "interval_half_width": half_width,
                 "ensemble_disagreement_sigma": sigma,
-                "nominal_coverage": self.nominal_coverage,
+                "nominal_coverage": 0.90,
             },
-            "applicability": {
-                "nn_similarity": nn_similarity,
-                "similarity_bin": self._similarity_bin(nn_similarity),
-                "empirical_ad_threshold": self.ad_threshold,
-                "empirical_in_domain": empirical_in_domain,
-                "domain_level": domain_level,
-                "confidence_level": confidence_level,
-            },
-            "expected_error_reference": expected_error,
-            "risk_flags": risk_flags,
-            "recommended_use": recommended_use,
+            "base_model_predictions": dict(zip(self.base_order, map(float, base_predictions))),
+            "structure_applicability_domain": structure,
+            "condition_applicability_domain": condition,
+            "failure_warning": warning,
+            "overall_risk": overall_risk,
             "neighbors": neighbors,
-            "base_model_predictions": {name: float(pred) for name, pred in zip(self.base_models.keys(), base_preds)},
+            "deployment": {
+                "feature_dimension": len(self.feature_names),
+                "model_purpose": self.manifest["model_purpose"],
+                "target_definition": self.manifest["target_definition"],
+            },
         }
 
 
-def translations(lang: str) -> Dict[str, str]:
-    zh = {
-        "report_title": "SO4 radical 单分子预测报告",
-        "input_smiles": "输入 SMILES",
-        "canonical_smiles": "规范化 SMILES",
-        "pred_logk": "预测 logK",
-        "pred_k": "预测 kSO4",
-        "interval": "预测区间",
-        "half_width": "区间半宽",
-        "sigma": "集成分歧 sigma",
-        "nn_similarity": "最近邻相似度",
-        "ad_threshold": "经验适用域阈值",
-        "domain_level": "适用域等级",
-        "confidence": "预测可信度",
-        "random_err": "预期绝对误差（随机分层参考）",
-        "scaffold_err": "预期绝对误差（新骨架参考）",
-        "risk_flags": "风险标签",
-        "recommendation": "使用建议",
-        "neighbors": "最相近训练样本",
-        "screening-ready": "适合优先级筛选和速率常数快速估计。",
-        "use-with-caution": "可作为定量参考，但应结合可信区间与结构风险标签谨慎解释。",
-        "coarse-screen-only": "更适合作为粗筛线索，不建议直接替代实验测定。",
-        "high-confidence": "高可信度",
-        "medium-confidence": "中等可信度",
-        "low-confidence": "低可信度",
-        "none": "无",
-    }
-    en = {
-        "report_title": "SO4 radical Single-Molecule Prediction Report",
-        "input_smiles": "Input SMILES",
-        "canonical_smiles": "Canonical SMILES",
-        "pred_logk": "Predicted logK",
-        "pred_k": "Predicted kSO4",
-        "interval": "Prediction interval",
-        "half_width": "Interval half-width",
-        "sigma": "Ensemble disagreement sigma",
-        "nn_similarity": "Nearest-neighbor similarity",
-        "ad_threshold": "Empirical AD threshold",
-        "domain_level": "Domain level",
-        "confidence": "Confidence",
-        "random_err": "Expected abs error (random-like reference)",
-        "scaffold_err": "Expected abs error (novel-scaffold reference)",
-        "risk_flags": "Risk flags",
-        "recommendation": "Recommendation",
-        "neighbors": "Nearest reference neighbors",
-        "screening-ready": "Suitable for prioritization and rapid rate-constant estimation.",
-        "use-with-caution": "Can be used as a quantitative reference, but interpret together with the interval and structural risk tags.",
-        "coarse-screen-only": "Use mainly as a coarse screening clue; do not directly replace experiments.",
-        "high-confidence": "High confidence",
-        "medium-confidence": "Medium confidence",
-        "low-confidence": "Low confidence",
-        "none": "none",
-    }
-    return zh if lang == "zh" else en
-
-
-def format_prediction_report(report: Dict[str, Any], lang: str = "en") -> str:
-    t = translations(lang)
-    pred = report["prediction"]
-    app = report["applicability"]
-    err = report["expected_error_reference"]
-    risks = report["risk_flags"] or [t["none"]]
-    neighbor_lines = [f"  {i}. {nb['compound_name']} | sim={nb['similarity']:.3f} | logK={nb['logK']:.3f}" for i, nb in enumerate(report["neighbors"], start=1)]
-    lines = [
-        t["report_title"],
-        "=" * 40,
-        f"{t['input_smiles']}: {report['input']['smiles']}",
-        f"{t['canonical_smiles']}: {report['input']['canonical_smiles']}",
-        f"{t['pred_logk']}: {pred['pred_logK']:.4f}",
-        f"{t['pred_k']}: {pred['pred_kSO4']:.4e}",
-        f"{t['interval']} ({int(pred['nominal_coverage']*100)}% nominal): [{pred['ci_lower']:.4f}, {pred['ci_upper']:.4f}]",
-        f"{t['half_width']}: {pred['ci_half_width']:.4f}",
-        f"{t['sigma']}: {pred['ensemble_disagreement_sigma']:.4f}",
-        f"{t['nn_similarity']}: {app['nn_similarity']:.3f} ({app['similarity_bin']})",
-        f"{t['ad_threshold']}: {app['empirical_ad_threshold']:.3f}",
-        f"{t['domain_level']}: {app['domain_level']} | empirical_in_domain={app['empirical_in_domain']}",
-        f"{t['confidence']}: {t.get(app['confidence_level'], app['confidence_level'])}",
-        f"{t['random_err']}: {err['random_mean_abs_error']:.3f}",
-        f"{t['scaffold_err']}: {err['scaffold_mean_abs_error']:.3f}",
-        f"{t['risk_flags']}: {', '.join(risks)}",
-        f"{t['recommendation']}: {t.get(report['recommended_use'], report['recommended_use'])}",
-        f"{t['neighbors']}:",
-        *neighbor_lines,
-    ]
-    return "\n".join(lines)
-
-
-def build_download_bundle(report: Dict[str, Any], lang: str = "en") -> bytes:
-    import zipfile
-
-    txt = format_prediction_report(report, lang=lang).encode("utf-8")
-    json_bytes = json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8")
-    neighbor_csv = pd.DataFrame(report["neighbors"]).to_csv(index=False).encode("utf-8-sig")
-    base_csv = pd.DataFrame([report["base_model_predictions"]]).to_csv(index=False).encode("utf-8-sig")
-    input_csv = pd.DataFrame([report["input"]]).to_csv(index=False).encode("utf-8-sig")
-    pred_csv = pd.DataFrame([
-        report["prediction"] | report["applicability"] | report["expected_error_reference"] | {"recommended_use": report["recommended_use"], "risk_flags": ";".join(report["risk_flags"])}
-    ]).to_csv(index=False).encode("utf-8-sig")
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("report.txt", txt)
-        zf.writestr("report.json", json_bytes)
-        zf.writestr("input.csv", input_csv)
-        zf.writestr("prediction_summary.csv", pred_csv)
-        zf.writestr("nearest_neighbors.csv", neighbor_csv)
-        zf.writestr("base_model_predictions.csv", base_csv)
-    return buf.getvalue()
+def build_download_bundle(report: Dict[str, Any]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("prediction_report.json", json.dumps(report, ensure_ascii=False, indent=2))
+        archive.writestr("nearest_neighbors.csv", pd.DataFrame(report["neighbors"]).to_csv(index=False))
+    return buffer.getvalue()
